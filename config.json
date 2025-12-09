@@ -1,0 +1,10 @@
+{
+  "overlay_width": 1920,
+  "overlay_height": 1080,
+  "overlay_screen": "HDMI-1",
+  "corner_enabled": true,
+  "corner_size": 60,
+  "corner_position": "bottom-right",
+  "server_enabled": false,
+  "server_port": 8765
+}

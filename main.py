@@ -196,10 +196,12 @@ class CornerWatcher:
         threshold_px: int,
         position: str,
         on_enter: Callable[[], None],
+        screen_name: Optional[str] = None,
     ) -> None:
         self._threshold_px = max(1, threshold_px)
         self._position = position
         self._on_enter = on_enter
+        self._target_screen_name = screen_name
         self._enabled = True
         self._in_corner = False
         self._timer = QTimer()
@@ -212,6 +214,10 @@ class CornerWatcher:
 
     def set_position(self, position: str) -> None:
         self._position = position
+        self._in_corner = False
+
+    def set_screen_name(self, screen_name: Optional[str]) -> None:
+        self._target_screen_name = screen_name
         self._in_corner = False
 
     def set_enabled(self, enabled: bool) -> None:
@@ -227,8 +233,15 @@ class CornerWatcher:
         screens = QGuiApplication.screens()
         if not screens:
             return
+        target_screen = None
+        if self._target_screen_name:
+            for s in screens:
+                if s.name() == self._target_screen_name:
+                    target_screen = s
+                    break
+        screens_to_check = [target_screen] if target_screen else screens
         in_any_corner = False
-        for screen in screens:
+        for screen in screens_to_check:
             geometry = screen.geometry()
             if _is_in_corner(geometry, x, y, self._threshold_px, self._position):
                 in_any_corner = True
@@ -304,21 +317,29 @@ class CornerIndicator(QWidget):
 
 
 class CornerIndicatorManager:
-    """Manages corner indicators for all screens."""
+    """Manages corner indicators for selected screen (or all if none)."""
 
-    def __init__(self, size: int, position: str, enabled: bool) -> None:
+    def __init__(self, size: int, position: str, enabled: bool, target_screen: Optional[str]) -> None:
         self._size = size
         self._position = position
         self._enabled = enabled
+        self._target_screen = target_screen
         self._indicators: list[CornerIndicator] = []
         self._rebuild()
 
     def _rebuild(self) -> None:
         for indicator in self._indicators:
             indicator.close()
-        self._indicators = [
-            CornerIndicator(screen, self._size, self._position) for screen in QGuiApplication.screens()
-        ]
+        screens = QGuiApplication.screens()
+        selected = None
+        if self._target_screen:
+            for s in screens:
+                if s.name() == self._target_screen:
+                    selected = s
+                    break
+        if selected:
+            screens = [selected]
+        self._indicators = [CornerIndicator(screen, self._size, self._position) for screen in screens]
         self._sync_visibility()
 
     def set_size(self, size: int) -> None:
@@ -332,6 +353,10 @@ class CornerIndicatorManager:
         for indicator in self._indicators:
             indicator.update_position(position)
         self._sync_visibility()
+
+    def set_target_screen(self, name: Optional[str]) -> None:
+        self._target_screen = name
+        self._rebuild()
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -449,64 +474,73 @@ class OverlayWindow(QWidget):
         self.hide()
         self._info_label.setText("Overlay idle")
 
+    def _resolve_screen_for_point(self, global_pos: QPoint) -> QScreen:
+        screen = self._target_screen
+        if screen:
+            geo = screen.geometry()
+            if geo.contains(global_pos):
+                return screen
+        detected = QGuiApplication.screenAt(global_pos)
+        return detected or self._target_screen or QGuiApplication.primaryScreen()
+
+    def _relative_payload(
+        self, global_pos: QPoint, extra: dict
+    ) -> tuple[str, dict]:
+        screen = self._resolve_screen_for_point(global_pos)
+        geo = screen.geometry()
+        rel_x = int(global_pos.x() - geo.x())
+        rel_y = int(global_pos.y() - geo.y())
+        prefix = f"screen {screen.name()} rel ({rel_x}, {rel_y}) • global ({int(global_pos.x())}, {int(global_pos.y())})"
+        payload = {
+            "screen": screen.name(),
+            "x": int(global_pos.x()),
+            "y": int(global_pos.y()),
+            "x_rel": rel_x,
+            "y_rel": rel_y,
+            "screen_width": geo.width(),
+            "screen_height": geo.height(),
+        }
+        payload.update(extra)
+        return prefix, payload
+
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         pos = event.position()
         global_pos = event.globalPosition()
-        text = (
-            f"Move @ overlay ({pos.x():.0f}, {pos.y():.0f}) • "
-            f"global ({global_pos.x():.0f}, {global_pos.y():.0f})"
-        )
+        prefix, payload = self._relative_payload(global_pos, {"type": "move"})
+        text = f"Move @ overlay ({pos.x():.0f}, {pos.y():.0f}) • {prefix}"
         self._info_label.setText(text)
-        payload = {
-            "type": "move",
-            "x": int(global_pos.x()),
-            "y": int(global_pos.y()),
-        }
         self._event_callback(text, payload)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         pos = event.position()
         global_pos = event.globalPosition()
         button = event.button().name if hasattr(event.button(), "name") else str(event.button())
-        text = (
-            f"Press {button} at overlay ({pos.x():.0f}, {pos.y():.0f}) • "
-            f"global ({global_pos.x():.0f}, {global_pos.y():.0f})"
+        prefix, payload = self._relative_payload(
+            global_pos, {"type": "press", "button": button}
         )
+        text = f"Press {button} at overlay ({pos.x():.0f}, {pos.y():.0f}) • {prefix}"
         self._event_label.setText(text)
-        payload = {
-            "type": "press",
-            "button": button,
-            "x": int(global_pos.x()),
-            "y": int(global_pos.y()),
-        }
         self._event_callback(text, payload)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         pos = event.position()
         global_pos = event.globalPosition()
         button = event.button().name if hasattr(event.button(), "name") else str(event.button())
-        text = (
-            f"Release {button} at overlay ({pos.x():.0f}, {pos.y():.0f}) • "
-            f"global ({global_pos.x():.0f}, {global_pos.y():.0f})"
+        prefix, payload = self._relative_payload(
+            global_pos, {"type": "release", "button": button}
         )
+        text = f"Release {button} at overlay ({pos.x():.0f}, {pos.y():.0f}) • {prefix}"
         self._event_label.setText(text)
-        payload = {
-            "type": "release",
-            "button": button,
-            "x": int(global_pos.x()),
-            "y": int(global_pos.y()),
-        }
         self._event_callback(text, payload)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         delta = event.angleDelta()
-        text = f"Wheel delta x={delta.x()} y={delta.y()}"
+        global_pos = event.globalPosition()
+        prefix, payload = self._relative_payload(
+            global_pos, {"type": "scroll", "dx": delta.x(), "dy": delta.y()}
+        )
+        text = f"Wheel delta x={delta.x()} y={delta.y()} • {prefix}"
         self._event_label.setText(text)
-        payload = {
-            "type": "scroll",
-            "dx": delta.x(),
-            "dy": delta.y(),
-        }
         self._event_callback(text, payload)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
@@ -620,6 +654,9 @@ class ControlWindow(QMainWindow):
         layout.addWidget(self._state_label)
         layout.addWidget(self._last_event_label)
         layout.addWidget(self._hotkey_hint)
+        self._cursor_screen_label = QLabel("Cursor screen: detecting...")
+        self._cursor_screen_label.setStyleSheet("color: #666;")
+        layout.addWidget(self._cursor_screen_label)
         layout.addLayout(size_grid)
         layout.addWidget(self._corner_checkbox)
         layout.addWidget(self._server_checkbox)
@@ -633,6 +670,7 @@ class ControlWindow(QMainWindow):
         self._register_corner_indicators()
         self._register_server()
         self._screen_combo.currentTextChanged.connect(self._on_screen_change_selection)
+        self._start_cursor_screen_tracker()
         self._apply_size()
 
     def _screen_size(self) -> QSize:
@@ -652,6 +690,7 @@ class ControlWindow(QMainWindow):
             threshold_px=self._corner_size_spin.value(),
             position=self._corner_position_combo.currentText(),
             on_enter=self._show_overlay_from_corner,
+            screen_name=self._screen_combo.currentText(),
         )
         self._corner_checkbox.toggled.connect(self._on_corner_toggle)
         self._corner_size_spin.valueChanged.connect(self._on_corner_size_change)
@@ -663,6 +702,7 @@ class ControlWindow(QMainWindow):
             size=self._corner_size_spin.value(),
             position=self._corner_position_combo.currentText(),
             enabled=self._corner_checkbox.isChecked(),
+            target_screen=self._screen_combo.currentText(),
         )
         self._connect_screen_signals()
 
@@ -730,6 +770,7 @@ class ControlWindow(QMainWindow):
         self._last_event_label.setText(f"Last event: {message}")
         # Also log to stdout for external piping/forwarding if desired.
         print(message)
+        self._update_cursor_screen_label()
 
     def _handle_overlay_event(self, message: str, payload: dict) -> None:
         self._set_last_event(message)
@@ -777,6 +818,10 @@ class ControlWindow(QMainWindow):
 
     def _on_screen_change_selection(self, _value: str) -> None:
         self._set_overlay_screen()
+        if self._corner_watcher:
+            self._corner_watcher.set_screen_name(self._screen_combo.currentText())
+        if self._corner_indicators:
+            self._corner_indicators.set_target_screen(self._screen_combo.currentText())
         # Optionally adapt size to selected screen if it would exceed the screen.
         screen = self._screen_map.get(self._screen_combo.currentText())
         if screen:
@@ -800,11 +845,26 @@ class ControlWindow(QMainWindow):
             self._corner_watcher.set_threshold(self._corner_size_spin.value())
             self._corner_watcher.set_enabled(self._corner_checkbox.isChecked())
             self._corner_watcher.set_position(self._corner_position_combo.currentText())
+            self._corner_watcher.set_screen_name(self._screen_combo.currentText())
         if self._corner_indicators:
             self._corner_indicators.set_size(self._corner_size_spin.value())
             self._corner_indicators.set_enabled(self._corner_checkbox.isChecked())
             self._corner_indicators.set_position(self._corner_position_combo.currentText())
+            self._corner_indicators.set_target_screen(self._screen_combo.currentText())
         self._save_config()
+
+    def _start_cursor_screen_tracker(self) -> None:
+        self._cursor_screen_timer = QTimer(self)
+        self._cursor_screen_timer.setInterval(200)
+        self._cursor_screen_timer.timeout.connect(self._update_cursor_screen_label)
+        self._cursor_screen_timer.start()
+        self._update_cursor_screen_label()
+
+    def _update_cursor_screen_label(self) -> None:
+        pos = QCursor.pos()
+        screen = QGuiApplication.screenAt(pos)
+        name = screen.name() if screen else "unknown"
+        self._cursor_screen_label.setText(f"Cursor screen: {name}")
 
     def _show_overlay_from_corner(self) -> None:
         if not self._overlay.isVisible():
@@ -824,6 +884,12 @@ class ControlWindow(QMainWindow):
             self._corner_indicators.handle_screen_change()
         # Re-apply screen target for overlay after hotplug changes.
         self._set_overlay_screen()
+        if self._corner_watcher:
+            self._corner_watcher.set_screen_name(self._screen_combo.currentText())
+        if self._corner_indicators:
+            self._corner_indicators.set_target_screen(self._screen_combo.currentText())
+        # Update cursor-screen tracking label immediately.
+        self._update_cursor_screen_label()
 
     def _refresh_screens(self) -> None:
         self._screen_map = {s.name(): s for s in QGuiApplication.screens()}
@@ -831,6 +897,15 @@ class ControlWindow(QMainWindow):
             primary = QGuiApplication.primaryScreen()
             if primary:
                 self._screen_map[primary.name()] = primary
+        # Keep the screen dropdown in sync with current map.
+        current = self._screen_combo.currentText() if hasattr(self, "_screen_combo") else ""
+        if hasattr(self, "_screen_combo"):
+            self._screen_combo.blockSignals(True)
+            self._screen_combo.clear()
+            self._screen_combo.addItems(self._screen_map.keys())
+            if current in self._screen_map:
+                self._screen_combo.setCurrentText(current)
+            self._screen_combo.blockSignals(False)
 
     def _save_config(self) -> None:
         self._config = {
